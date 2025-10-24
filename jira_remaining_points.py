@@ -3,7 +3,7 @@ import os, sys, csv, time, math, base64, datetime as dt
 import requests
 from urllib.parse import urljoin
 
-# -------- Config from env --------
+# -------- Config from env -------
 JIRA_BASE_URL        = os.getenv("JIRA_BASE_URL")            # e.g. https://yourdomain.atlassian.net/
 JIRA_EMAIL           = os.getenv("JIRA_EMAIL")               # your Atlassian email
 JIRA_API_TOKEN       = os.getenv("JIRA_API_TOKEN")           # API token
