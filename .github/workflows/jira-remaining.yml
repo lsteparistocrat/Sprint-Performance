@@ -36,41 +36,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Create extractor script (no heredoc)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            fs.mkdirSync('scripts', { recursive: true });
-            const py = `#!/usr/bin/env python3
-import os, sys, csv, time, requests, datetime as dt
-from urllib.parse import urljoin
-
-JIRA_BASE_URL        = os.getenv("JIRA_BASE_URL")
-JIRA_EMAIL           = os.getenv("JIRA_EMAIL")
-JIRA_API_TOKEN       = os.getenv("JIRA_API_TOKEN")
-SPRINT_ID            = os.getenv("SPRINT_ID")
-SP_FIELD             = os.getenv("STORY_POINTS_FIELD")
-TRACK_STATUS_NAMES   = [s.strip() for s in os.getenv("TRACK_STATUS_NAMES", "To Do,In Progress,Code Review").split(",")]
-UAT_STATUS_NAME      = os.getenv("UAT_STATUS_NAME", "UAT")
-TREAT_UAT_AS_DONE_PERMANENT = os.getenv("UAT_IS_PERMANENT", "true").lower() == "true"
-OUT_DIR              = os.getenv("OUT_DIR", "data")
-
-missing = [k for k,v in {
-  "JIRA_BASE_URL":JIRA_BASE_URL, "JIRA_EMAIL":JIRA_EMAIL, "JIRA_API_TOKEN":JIRA_API_TOKEN,
-  "STORY_POINTS_FIELD":SP_FIELD, "SPRINT_ID":SPRINT_ID
-}.items() if not v]
-if missing:
-    print(f"Missing env vars: {', '.join(missing)}", file=sys.stderr); sys.exit(2)
-
-session = requests.Session()
-session.auth = (JIRA_EMAIL, JIRA_API_TOKEN)
-session.headers.update({"Accept":"application/json"})
-
-def get(url, params=None):
-    r = session.get(url, params=params, timeout=30)
-    if r.status_code == 429:
-        time.sleep(5)
-        r = session.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return
+      - name: Write extractor script
+        uses: actions/github-scrip
