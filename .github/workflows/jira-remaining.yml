@@ -1,3 +1,24 @@
+name: Jira Remaining Points (by Sprint)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sprint_id:
+        description: "Jira sprint ID"
+        required: true
+      track_status_names:
+        description: "Comma-separated statuses to count (e.g. To Do,In Progress,Code Review)"
+        required: false
+        default: "To Do,In Progress,Code Review"
+      uat_status_name:
+        description: "Status name treated as done"
+        required: false
+        default: "UAT"
+      uat_is_permanent:
+        description: "Once UAT, always 0 afterwards? (true/false)"
+        required: false
+        default: "true"
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -54,186 +75,6 @@ def get(url, params=None):
     return r.json()
 
 def jira_url(path): return urljoin(JIRA_BASE_URL, path)
-
 def get_sprint(sprint_id): return get(jira_url(f"/rest/agile/1.0/sprint/{sprint_id}"))
 
-def list_sprint_issues(sprint_id):
-    issues, start_at = [], 0
-    while True:
-        data = get(jira_url(f"/rest/agile/1.0/sprint/{sprint_id}/issue"),
-                   params={"maxResults":50, "startAt":start_at})
-        issues.extend(data.get("issues", []))
-        if start_at + data.get("maxResults", 50) >= data.get("total", 0): break
-        start_at += data.get("maxResults", 50)
-    return [i["key"] for i in issues]
-
-def get_issue_with_changelog(key):
-    data = get(jira_url(f"/rest/api/3/issue/{key}"), params={"expand":"changelog"})
-    changelog = data.get("changelog", {})
-    histories = changelog.get("histories", [])
-    total = changelog.get("total", len(histories))
-    start_at = changelog.get("startAt", 0)
-    max_results = changelog.get("maxResults", len(histories)) or 100
-    while start_at + max_results < total:
-        start_at += max_results
-        page = get(jira_url(f"/rest/api/3/issue/{key}/changelog"),
-                   params={"startAt":start_at, "maxResults":100})
-        histories.extend(page.get("values", []))
-        total = page.get("total", total)
-        max_results = page.get("maxResults", 100)
-    return data, histories
-
-# ---- Robust Jira timestamp -> date
-def iso_to_date(iso_str: str) -> dt.date:
-    """
-    Handles:
-      - 2025-10-24T11:23:00.000+0000
-      - 2025-10-24T11:23:00.000Z
-      - 2025-10-24T11:23:00+00:00
-    """
-    s = iso_str.strip().replace("Z", "+00:00")
-    # Insert colon in timezone if missing (e.g., +0000 -> +00:00)
-    if len(s) >= 5 and (s[-5] in ["+", "-"]) and s[-3] != ":":
-        s = s[:-2] + ":" + s[-2:]
-    # Ensure milliseconds don’t break parsing if they come as .000+00:00
-    try:
-        d = dt.datetime.fromisoformat(s)
-    except ValueError:
-        # Fallback: strip milliseconds if present
-        if "." in s:
-            main, rest = s.split(".", 1)
-            # keep timezone part
-            if "+" in rest:
-                ms, tz = rest.split("+", 1)
-                s2 = f"{main}+{tz if tz.startswith('0') or tz.startswith('1') else tz}"
-                # Re-insert + and colon if needed already handled above
-                try:
-                    d = dt.datetime.fromisoformat(s2)
-                except Exception:
-                    raise
-            elif "-" in rest:
-                ms, tz = rest.split("-", 1)
-                s2 = f"{main}-{tz}"
-                d = dt.datetime.fromisoformat(s2)
-        else:
-            raise
-    return d.date()
-
-def daterange(start, end):
-    cur = start
-    while cur <= end:
-        yield cur
-        cur += dt.timedelta(days=1)
-
-def sprint_date_bounds(sprint):
-    sd = sprint.get("startDate"); ed = sprint.get("endDate") or sprint.get("completeDate")
-    if not sd or not ed:
-        raise RuntimeError("Sprint missing startDate/endDate.")
-    return iso_to_date(sd), iso_to_date(ed)
-
-def extract_status_changes(histories):
-    events=[]
-    for h in histories:
-        when = h.get("created")
-        for item in h.get("items", []):
-            if item.get("field") == "status":
-                events.append((iso_to_date(when), item.get("fromString"), item.get("toString")))
-    events.sort(key=lambda x: x[0])
-    return events
-
-def first_date_reaching_status(histories, target):
-    for d, _f, to in extract_status_changes(histories):
-        if to == target: return d
-    return None
-
-def status_on_date(initial_status, histories, day):
-    current = initial_status
-    for d, _f, to in extract_status_changes(histories):
-        if d <= day: current = to
-        else: break
-    return current
-
-def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    sprint = get_sprint(SPRINT_ID)
-    sprint_start, sprint_end = sprint_date_bounds(sprint)
-    keys = list_sprint_issues(sprint["id"])
-    print(f"Found {len(keys)} issues in sprint {sprint['name']} ({sprint['id']}).")
-    days = list(daterange(sprint_start, sprint_end))
-
-    rows=[]
-    for key in keys:
-        issue, histories = get_issue_with_changelog(key)
-        f = issue.get("fields", {})
-        sp = f.get(SP_FIELD) or 0.0
-        try: sp = float(sp)
-        except: sp = 0.0
-        initial_status = f["status"]["name"]
-        created_date = iso_to_date(f["created"])
-        hit_uat_on = first_date_reaching_status(histories, UAT_STATUS_NAME)
-
-        for day in days:
-            if day < created_date: continue
-            if hit_uat_on and day >= hit_uat_on and TREAT_UAT_AS_DONE_PERMANENT:
-                remain = 0.0
-            else:
-                status_today = status_on_date(initial_status, histories, day)
-                if hit_uat_on and day >= hit_uat_on and not TREAT_UAT_AS_DONE_PERMANENT:
-                    remain = 0.0 if status_today == UAT_STATUS_NAME else (sp if status_today in TRACK_STATUS_NAMES else 0.0)
-                else:
-                    remain = sp if status_today in TRACK_STATUS_NAMES else 0.0
-            rows.append({
-                "date": day.isoformat(),
-                "issue": key,
-                "status": status_on_date(initial_status, histories, day),
-                "story_points": sp,
-                "remaining_for_issue": remain
-            })
-        time.sleep(0.1)
-
-    by_day={}
-    for r in rows:
-        by_day.setdefault(r["date"], 0.0)
-        by_day[r["date"]] += r["remaining_for_issue"]
-
-    out_path = os.path.join(OUT_DIR, f"sprint_{sprint['id']}_remaining.csv")
-    with open(out_path, "w", newline="") as f:
-        f.write("date,remaining_story_points\n")
-        for d in sorted(by_day.keys()):
-            f.write(f"{d},{by_day[d]:.2f}\n")
-
-    details_path = os.path.join(OUT_DIR, f"sprint_{sprint['id']}_remaining_details.csv")
-    with open(details_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["date","issue","status","story_points","remaining_for_issue"])
-        w.writeheader()
-        for r in sorted(rows, key=lambda x:(x["date"], x["issue"])):
-            w.writerow(r)
-
-    print(f"Wrote {out_path}")
-    print(f"Wrote {details_path}")
-
-if __name__ == "__main__":
-    main()
-PY
-          chmod +x scripts/jira_remaining_points.py
-
-      - name: Run extractor
-        env:
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          STORY_POINTS_FIELD: ${{ secrets.STORY_POINTS_FIELD }}
-          SPRINT_ID: ${{ github.event.inputs.sprint_id }}
-          TRACK_STATUS_NAMES: ${{ github.event.inputs.track_status_names }}
-          UAT_STATUS_NAME: ${{ github.event.inputs.uat_status_name }}
-          UAT_IS_PERMANENT: ${{ github.event.inputs.uat_is_permanent }}
-          OUT_DIR: data
-        run: python scripts/jira_remaining_points.py
-
-      - name: Upload CSV artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: sprint-${{ github.event.inputs.sprint_id }}-remaining
-          path: |
-            data/sprint_${{ github.event.inputs.sprint_id }}_remaining.csv
-            data/sprint_${{ github.event.inputs.sprint_id }}_remaining_details.csv
+def list_sprint_issues(sprint
