@@ -1,24 +1,3 @@
-name: Jira Remaining Points (by Sprint)
-
-on:
-  workflow_dispatch:
-    inputs:
-      sprint_id:
-        description: "Jira sprint ID"
-        required: true
-      track_status_names:
-        description: "Comma-separated statuses to count (e.g. To Do,In Progress,Code Review)"
-        required: false
-        default: "To Do,In Progress,Code Review"
-      uat_status_name:
-        description: "Status name treated as done"
-        required: false
-        default: "UAT"
-      uat_is_permanent:
-        description: "Once UAT, always 0 afterwards? (true/false)"
-        required: false
-        default: "true"
-
 jobs:
   run:
     runs-on: ubuntu-latest
