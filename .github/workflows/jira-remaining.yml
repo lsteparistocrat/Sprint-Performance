@@ -1,0 +1,58 @@
+name: Jira Remaining Points (by Sprint)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sprint_id:
+        description: "Jira sprint ID"
+        required: true
+      track_status_names:
+        description: "Comma-separated statuses to count (e.g. To Do,In Progress,Code Review)"
+        required: false
+        default: "To Do,In Progress,Code Review"
+      uat_status_name:
+        description: "Status name treated as done"
+        required: false
+        default: "UAT"
+      uat_is_permanent:
+        description: "Once UAT, always 0 afterwards? (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run extractor
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          STORY_POINTS_FIELD: ${{ secrets.STORY_POINTS_FIELD }}   # e.g. customfield_10016
+          SPRINT_ID: ${{ github.event.inputs.sprint_id }}
+          TRACK_STATUS_NAMES: ${{ github.event.inputs.track_status_names }}
+          UAT_STATUS_NAME: ${{ github.event.inputs.uat_status_name }}
+          UAT_IS_PERMANENT: ${{ github.event.inputs.uat_is_permanent }}
+          OUT_DIR: data
+        run: |
+          python scripts/jira_remaining_points.py
+
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprint-${{ github.event.inputs.sprint_id }}-remaining
+          path: |
+            data/sprint_${{ github.event.inputs.sprint_id }}_remaining.csv
+            data/sprint_${{ github.event.inputs.sprint_id }}_remaining_details.csv
