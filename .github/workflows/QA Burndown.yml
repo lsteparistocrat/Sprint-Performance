@@ -41,7 +41,7 @@ jobs:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          STORY_POINTS_FIELD: ${{ secrets.STORY_POINTS_FIELD }}  # e.g., customfield_10016
+          STORY_POINTS_FIELD: "customfield_10102"  # e.g., customfield_10016
           SPRINT_ID: ${{ github.event.inputs.sprint_id }}
           TRACK_STATUS_NAMES: ${{ github.event.inputs.track_status_names }}   # default "UAT,UAT Testing"
           UAT_STATUS_NAME: ${{ github.event.inputs.uat_status_name }}         # default ""
