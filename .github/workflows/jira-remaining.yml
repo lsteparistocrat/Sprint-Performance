@@ -1,16 +1,53 @@
-      - name: Write extractor script (robust + no-expand)
+name: Jira Remaining Points (by Sprint)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sprint_id:
+        description: "Jira sprint ID"
+        required: true
+      track_status_names:
+        description: "Comma-separated statuses to count (e.g. To Do,In Progress,Code Review)"
+        required: false
+        default: "To Do,In Progress,Code Review"
+      uat_status_name:
+        description: "Status name treated as done"
+        required: false
+        default: "UAT"
+      uat_is_permanent:
+        description: "Once UAT, always 0 afterwards? (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Write extractor script
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             fs.mkdirSync('scripts', { recursive: true });
-            fs.writeFileSync('scripts/jira_remaining_points.py', String.raw`#!/usr/bin/env python3
+            fs.writeFileSync('scripts/jira_remaining_points.py', `#!/usr/bin/env python3
 import os, sys, csv, time, math, requests, datetime as dt
 from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# -------- Config from env --------
 JIRA_BASE_URL        = os.getenv("JIRA_BASE_URL")
 JIRA_EMAIL           = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN       = os.getenv("JIRA_API_TOKEN")
@@ -20,12 +57,11 @@ TRACK_STATUS_NAMES   = [s.strip() for s in os.getenv("TRACK_STATUS_NAMES", "To D
 UAT_STATUS_NAME      = os.getenv("UAT_STATUS_NAME", "UAT")
 TREAT_UAT_AS_DONE_PERMANENT = os.getenv("UAT_IS_PERMANENT", "true").lower() == "true"
 OUT_DIR              = os.getenv("OUT_DIR", "data")
-# Tuning knobs
-HTTP_TIMEOUT         = int(os.getenv("HTTP_TIMEOUT", "120"))      # seconds
+HTTP_TIMEOUT         = int(os.getenv("HTTP_TIMEOUT", "120"))
 MAX_RETRIES          = int(os.getenv("MAX_RETRIES", "5"))
 BACKOFF_FACTOR       = float(os.getenv("BACKOFF_FACTOR", "1.5"))
 SLEEP_BETWEEN_ISSUES = float(os.getenv("SLEEP_BETWEEN_ISSUES", "0.2"))
-LIMIT_ISSUES         = int(os.getenv("LIMIT_ISSUES", "0"))        # 0 = no limit
+LIMIT_ISSUES         = int(os.getenv("LIMIT_ISSUES", "0"))
 
 missing = [k for k,v in {
   "JIRA_BASE_URL":JIRA_BASE_URL, "JIRA_EMAIL":JIRA_EMAIL, "JIRA_API_TOKEN":JIRA_API_TOKEN,
@@ -34,76 +70,53 @@ missing = [k for k,v in {
 if missing:
     print(f"Missing env vars: {', '.join(missing)}", file=sys.stderr); sys.exit(2)
 
-# -------- HTTP session with robust retries --------
 session = requests.Session()
 session.auth = (JIRA_EMAIL, JIRA_API_TOKEN)
 session.headers.update({"Accept":"application/json"})
-
-retry = Retry(
-    total=MAX_RETRIES,
-    connect=MAX_RETRIES,
-    read=MAX_RETRIES,
-    backoff_factor=BACKOFF_FACTOR,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "HEAD", "OPTIONS"],
-    respect_retry_after_header=True,
-)
+retry = Retry(total=MAX_RETRIES, connect=MAX_RETRIES, read=MAX_RETRIES, backoff_factor=BACKOFF_FACTOR,
+              status_forcelist=[429,500,502,503,504], allowed_methods=["GET","HEAD","OPTIONS"], respect_retry_after_header=True)
 adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
+session.mount("https://", adapter); session.mount("http://", adapter)
 
 def get_json(url, params=None):
-    # single place to call GET with longer timeout and clean errors
     r = session.get(url, params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 def jira_url(path): return urljoin(JIRA_BASE_URL, path)
-
-def get_sprint(sprint_id): 
-    return get_json(jira_url(f"/rest/agile/1.0/sprint/{sprint_id}"))
+def get_sprint(sprint_id): return get_json(jira_url(f"/rest/agile/1.0/sprint/{sprint_id}"))
 
 def list_sprint_issues(sprint_id):
     issues, start_at = [], 0
     while True:
-        data = get_json(jira_url(f"/rest/agile/1.0/sprint/{sprint_id}/issue"),
-                        params={"maxResults":50, "startAt":start_at, "fields":"key"})
+        data = get_json(jira_url(f"/rest/agile/1.0/sprint/{sprint_id}/issue"), params={"maxResults":50, "startAt":start_at, "fields":"key"})
         issues.extend(data.get("issues", []))
-        total = data.get("total", 0)
-        maxr  = data.get("maxResults", 50)
+        total = data.get("total", 0); maxr = data.get("maxResults", 50)
         if start_at + maxr >= total: break
         start_at += maxr
     keys = [i["key"] for i in issues]
     return keys if LIMIT_ISSUES <= 0 else keys[:LIMIT_ISSUES]
 
 def get_issue_fields(key):
-    # fetch only the fields we need, no expand
     fields = ",".join(["status","created",SP_FIELD])
-    data = get_json(jira_url(f"/rest/api/3/issue/{key}"), params={"fields":fields})
-    return data
+    return get_json(jira_url(f"/rest/api/3/issue/{key}"), params={"fields":fields})
 
 def get_issue_changelog_all(key):
-    # fetch changelog via paginated endpoint (100 per page)
-    histories = []
-    start_at = 0
+    histories, start_at = [], 0
     while True:
-        page = get_json(jira_url(f"/rest/api/3/issue/{key}/changelog"),
-                        params={"startAt":start_at, "maxResults":100})
+        page = get_json(jira_url(f"/rest/api/3/issue/{key}/changelog"), params={"startAt":start_at, "maxResults":100})
         vals = page.get("values", [])
         histories.extend(vals)
-        total = page.get("total", len(histories))
-        maxr  = page.get("maxResults", 100)
+        total = page.get("total", len(histories)); maxr = page.get("maxResults", 100)
         if start_at + maxr >= total: break
         start_at += maxr
     return histories
 
-# ---- Robust Jira timestamp -> date
 def iso_to_date(iso_str: str) -> dt.date:
     s = iso_str.strip().replace("Z", "+00:00")
     if len(s) >= 5 and (s[-5] in ["+", "-"]) and s[-3] != ":":
         s = s[:-2] + ":" + s[-2:]
-    d = dt.datetime.fromisoformat(s)
-    return d.date()
+    return dt.datetime.fromisoformat(s).date()
 
 def daterange(start, end):
     cur = start
@@ -113,8 +126,7 @@ def daterange(start, end):
 
 def sprint_date_bounds(sprint):
     sd = sprint.get("startDate"); ed = sprint.get("endDate") or sprint.get("completeDate")
-    if not sd or not ed:
-        raise RuntimeError("Sprint missing startDate/endDate.")
+    if not sd or not ed: raise RuntimeError("Sprint missing startDate/endDate.")
     return iso_to_date(sd), iso_to_date(ed)
 
 def extract_status_changes(histories):
@@ -147,20 +159,14 @@ def main():
     print(f"Found {len(keys)} issues in sprint {sprint['name']} ({sprint['id']}).")
     days = list(daterange(sprint_start, sprint_end))
 
-    rows=[]
-    skipped=[]
-    for idx, key in enumerate(keys, 1):
+    rows=[]; skipped=[]
+    for key in keys:
         try:
             issue = get_issue_fields(key)
             histories = get_issue_changelog_all(key)
-        except requests.exceptions.ReadTimeout:
-            print(f"WARNING: timeout on {key}; skipping.", file=sys.stderr)
-            skipped.append(key)
-            continue
         except requests.exceptions.RequestException as e:
-            print(f"WARNING: request error on {key}: {e}; skipping.", file=sys.stderr)
-            skipped.append(key)
-            continue
+            print(f"WARNING: skipping {key} due to request error: {e}", file=sys.stderr)
+            skipped.append(key); continue
 
         f = issue.get("fields", {})
         sp = f.get(SP_FIELD) or 0.0
@@ -180,22 +186,16 @@ def main():
                     remain = 0.0 if status_today == UAT_STATUS_NAME else (sp if status_today in TRACK_STATUS_NAMES else 0.0)
                 else:
                     remain = sp if status_today in TRACK_STATUS_NAMES else 0.0
-            rows.append({
-                "date": day.isoformat(),
-                "issue": key,
-                "status": status_on_date(initial_status, histories, day),
-                "story_points": sp,
-                "remaining_for_issue": remain
-            })
+            rows.append({"date":day.isoformat(),"issue":key,"status":status_on_date(initial_status, histories, day),"story_points":sp,"remaining_for_issue":remain})
 
-        if SLEEP_BETWEEN_ISSUES > 0:
-            time.sleep(SLEEP_BETWEEN_ISSUES)
+        if SLEEP_BETWEEN_ISSUES > 0: time.sleep(SLEEP_BETWEEN_ISSUES)
 
     by_day={}
     for r in rows:
         by_day.setdefault(r["date"], 0.0)
         by_day[r["date"]] += r["remaining_for_issue"]
 
+    os.makedirs(OUT_DIR, exist_ok=True)
     out_path = os.path.join(OUT_DIR, f"sprint_{sprint['id']}_remaining.csv")
     with open(out_path, "w", newline="") as f:
         f.write("date,remaining_story_points\n")
@@ -210,10 +210,35 @@ def main():
             w.writerow(r)
 
     if skipped:
-        print(f"Skipped {len(skipped)} issues due to timeouts/errors: {', '.join(skipped)}", file=sys.stderr)
+        print(f"Skipped {len(skipped)} issues due to errors: {', '.join(skipped)}", file=sys.stderr)
     print(f"Wrote {out_path}")
     print(f"Wrote {details_path}")
 
 if __name__ == "__main__":
     main()
 `);
+
+      - name: Run extractor
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          STORY_POINTS_FIELD: ${{ secrets.STORY_POINTS_FIELD }}
+          SPRINT_ID: ${{ github.event.inputs.sprint_id }}
+          TRACK_STATUS_NAMES: ${{ github.event.inputs.track_status_names }}
+          UAT_STATUS_NAME: ${{ github.event.inputs.uat_status_name }}
+          UAT_IS_PERMANENT: ${{ github.event.inputs.uat_is_permanent }}
+          OUT_DIR: data
+          HTTP_TIMEOUT: "180"           # optional tuning
+          MAX_RETRIES: "6"
+          BACKOFF_FACTOR: "2.0"
+          SLEEP_BETWEEN_ISSUES: "0.3"
+        run: python scripts/jira_remaining_points.py
+
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprint-${{ github.event.inputs.sprint_id }}-remaining
+          path: |
+            data/sprint_${{ github.event.inputs.sprint_id }}_remaining.csv
+            data/sprint_${{ github.event.inputs.sprint_id }}_remaining_details.csv
