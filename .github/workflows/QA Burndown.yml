@@ -1,0 +1,241 @@
+name: QA Burndown
+
+on:
+  workflow_dispatch:
+    inputs:
+      sprint_id:
+        description: "Jira sprint ID"
+        required: true
+      track_status_names:
+        description: "Comma-separated statuses to count"
+        required: false
+        default: "UAT,UAT Testing"   # <- only these count points
+      uat_status_name:
+        description: "Leave blank to disable special UAT=0 rule"
+        required: false
+        default: ""                  # <- disables 'UAT means zero' behavior
+      uat_is_permanent:
+        description: "Ignored when uat_status_name is blank"
+        required: false
+        default: "false"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-dateutil
+
+      - name: Extract remaining points (only UAT/UAT Testing)
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          STORY_POINTS_FIELD: ${{ secrets.STORY_POINTS_FIELD }}  # e.g., customfield_10016
+          SPRINT_ID: ${{ github.event.inputs.sprint_id }}
+          TRACK_STATUS_NAMES: ${{ github.event.inputs.track_status_names }}   # default "UAT,UAT Testing"
+          UAT_STATUS_NAME: ${{ github.event.inputs.uat_status_name }}         # default ""
+          UAT_IS_PERMANENT: ${{ github.event.inputs.uat_is_permanent }}       # default "false"
+          OUT_DIR: data
+          HTTP_TIMEOUT: "180"
+          MAX_RETRIES: "6"
+          BACKOFF_FACTOR: "2.0"
+          SLEEP_BETWEEN_ISSUES: "0.3"
+        run: |
+          python - <<'PY'
+          import os, sys, csv, time, requests
+          from urllib.parse import urljoin
+          from dateutil import parser as dp
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          # ----- Config from env
+          JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
+          JIRA_EMAIL = os.getenv("JIRA_EMAIL")
+          JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+          SPRINT_ID = os.getenv("SPRINT_ID")
+          SP_FIELD = os.getenv("STORY_POINTS_FIELD")
+          TRACK_STATUS_NAMES = [s.strip() for s in os.getenv("TRACK_STATUS_NAMES","UAT,UAT Testing").split(",") if s.strip()]
+          UAT_STATUS_NAME = os.getenv("UAT_STATUS_NAME","").strip()  # blank disables special rule
+          TREAT_UAT_AS_DONE_PERMANENT = os.getenv("UAT_IS_PERMANENT","false").lower() == "true"
+          OUT_DIR = os.getenv("OUT_DIR","data")
+          HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT","180"))
+          MAX_RETRIES = int(os.getenv("MAX_RETRIES","6"))
+          BACKOFF_FACTOR = float(os.getenv("BACKOFF_FACTOR","2.0"))
+          SLEEP_BETWEEN_ISSUES = float(os.getenv("SLEEP_BETWEEN_ISSUES","0.3"))
+
+          missing = [k for k,v in {
+            "JIRA_BASE_URL":JIRA_BASE_URL, "JIRA_EMAIL":JIRA_EMAIL, "JIRA_API_TOKEN":JIRA_API_TOKEN,
+            "STORY_POINTS_FIELD":SP_FIELD, "SPRINT_ID":SPRINT_ID
+          }.items() if not v]
+          if missing:
+              print("Missing env vars: "+", ".join(missing), file=sys.stderr); sys.exit(2)
+
+          # ----- HTTP with retries
+          session = requests.Session()
+          session.auth = (JIRA_EMAIL, JIRA_API_TOKEN)
+          session.headers.update({"Accept":"application/json"})
+          retry = Retry(total=MAX_RETRIES, connect=MAX_RETRIES, read=MAX_RETRIES,
+                        backoff_factor=BACKOFF_FACTOR,
+                        status_forcelist=[429,500,502,503,504],
+                        allowed_methods=["GET","HEAD","OPTIONS"],
+                        respect_retry_after_header=True)
+          adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+          session.mount("https://", adapter); session.mount("http://", adapter)
+
+          def jurl(path): return urljoin(JIRA_BASE_URL, path)
+          def GET(url, **params):
+              r = session.get(url, params=params or None, timeout=HTTP_TIMEOUT)
+              r.raise_for_status(); return r.json()
+
+          def date_only(s): return dp.parse(s).date()
+
+          def get_sprint(sprint_id):
+              return GET(jurl(f"/rest/agile/1.0/sprint/{sprint_id}"))
+
+          def list_sprint_issue_keys(sprint_id):
+              keys, start = [], 0
+              while True:
+                  data = GET(jurl(f"/rest/agile/1.0/sprint/{sprint_id}/issue"), maxResults=50, startAt=start, fields="key")
+                  keys += [i["key"] for i in data.get("issues", [])]
+                  total = data.get("total", 0); maxr = data.get("maxResults", 50)
+                  if start + maxr >= total: break
+                  start += maxr
+              return keys
+
+          def get_issue_fields(key):
+              fields = ",".join(["status","created",SP_FIELD])
+              return GET(jurl(f"/rest/api/3/issue/{key}"), fields=fields)
+
+          def get_issue_changelog(key):
+              hist, start = [], 0
+              while True:
+                  page = GET(jurl(f"/rest/api/3/issue/{key}/changelog"), startAt=start, maxResults=100)
+                  vals = page.get("values", [])
+                  hist.extend(vals)
+                  total = page.get("total", len(hist)); maxr = page.get("maxResults", 100)
+                  if start + maxr >= total: break
+                  start += maxr
+              return hist
+
+          def sprint_bounds(sp):
+              sd = sp.get("startDate"); ed = sp.get("endDate") or sp.get("completeDate")
+              if not sd or not ed: raise RuntimeError("Sprint missing start/end date")
+              return date_only(sd), date_only(ed)
+
+          def day_range(a,b):
+              from datetime import timedelta
+              d=a
+              while d<=b:
+                  yield d
+                  d+=timedelta(days=1)
+
+          def status_events(hist):
+              ev=[]
+              for h in hist:
+                  when = date_only(h.get("created"))
+                  for it in h.get("items", []):
+                      if it.get("field")=="status":
+                          ev.append((when, it.get("fromString"), it.get("toString")))
+              ev.sort(key=lambda x:x[0]); return ev
+
+          def first_reach(hist, target):
+              for d,_f,to in status_events(hist):
+                  if to==target: return d
+              return None
+
+          def status_on(initial, hist, day):
+              cur=initial
+              for d,_f,to in status_events(hist):
+                  if d<=day: cur=to
+                  else: break
+              return cur
+
+          # ----- Run
+          os.makedirs(OUT_DIR, exist_ok=True)
+          sprint = get_sprint(SPRINT_ID)
+          s_start, s_end = sprint_bounds(sprint)
+          keys = list_sprint_issue_keys(sprint["id"])
+          print(f"Found {len(keys)} issues in sprint {sprint['name']} ({sprint['id']}).")
+          days = list(day_range(s_start, s_end))
+
+          rows=[]; skipped=[]
+          for k in keys:
+              try:
+                  issue = get_issue_fields(k)
+                  hist  = get_issue_changelog(k)
+              except requests.exceptions.RequestException as e:
+                  print(f"WARNING skip {k}: {e}", file=sys.stderr); skipped.append(k); continue
+
+              f = issue["fields"]
+              sp = f.get(SP_FIELD) or 0.0
+              try: sp = float(sp)
+              except: sp = 0.0
+              initial = f["status"]["name"]
+              created = date_only(f["created"])
+              hit_uat = first_reach(hist, UAT_STATUS_NAME) if UAT_STATUS_NAME else None
+
+              for d in days:
+                  if d < created: continue
+                  st = status_on(initial, hist, d)
+
+                  if UAT_STATUS_NAME:  # special UAT=0 rule only if provided
+                      if hit_uat and d >= hit_uat and TREAT_UAT_AS_DONE_PERMANENT:
+                          remain = 0.0
+                      else:
+                          if hit_uat and d >= hit_uat and not TREAT_UAT_AS_DONE_PERMANENT and st == UAT_STATUS_NAME:
+                              remain = 0.0
+                          else:
+                              remain = sp if st in TRACK_STATUS_NAMES else 0.0
+                  else:
+                      # special rule disabled → only statuses in list count
+                      remain = sp if st in TRACK_STATUS_NAMES else 0.0
+
+                  rows.append({
+                      "date": d.isoformat(),
+                      "issue": k,
+                      "status": st,
+                      "story_points": sp,
+                      "remaining_for_issue": remain
+                  })
+              time.sleep(SLEEP_BETWEEN_ISSUES)
+
+          # aggregate per-day
+          by_day={}
+          for r in rows:
+              by_day[r["date"]] = by_day.get(r["date"], 0.0) + r["remaining_for_issue"]
+
+          out1 = os.path.join(OUT_DIR, f"sprint_{sprint['id']}_remaining.csv")
+          with open(out1, "w", newline="") as f:
+              f.write("date,remaining_story_points\n")
+              for d in sorted(by_day.keys()):
+                  f.write(f"{d},{by_day[d]:.2f}\n")
+
+          out2 = os.path.join(OUT_DIR, f"sprint_{sprint['id']}_remaining_details.csv")
+          with open(out2, "w", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=["date","issue","status","story_points","remaining_for_issue"])
+              w.writeheader()
+              for r in sorted(rows, key=lambda x:(x["date"], x["issue"])):
+                  w.writerow(r)
+
+          print(f"Wrote {out1}")
+          print(f"Wrote {out2}")
+          PY
+
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprint-${{ github.event.inputs.sprint_id }}-remaining
+          path: |
+            data/sprint_${{ github.event.inputs.sprint_id }}_remaining.csv
+            data/sprint_${{ github.event.inputs.sprint_id }}_remaining_details.csv
