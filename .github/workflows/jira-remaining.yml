@@ -1,4 +1,4 @@
-name: Jira Remaining Points (by Sprint)
+name: DEV Jira Remaining Points (by Sprint)
 
 on:
   workflow_dispatch:
